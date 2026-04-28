@@ -1,4 +1,4 @@
-# rapier-kinematic-controller(kcc)
+# Rapier-Kinematic-Character-Controller(kcc)
 
 **A stable kinematic character controller for Rapier with moving platforms, rotation support and reliable grounding.**
 
