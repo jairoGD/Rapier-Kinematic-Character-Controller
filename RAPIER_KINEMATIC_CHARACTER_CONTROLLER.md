@@ -24,6 +24,7 @@ The snippets are written in JavaScript-style pseudocode and can be adapted to Ty
 ```js
 const kccState = {
   desiredVelocity: vec3(0, 0, 0),   // set by gameplay input each frame
+  planarVelocity: vec3(0, 0, 0),    // traction and sliding state
   verticalVelocity: 0,              // gravity + jump
   grounded: false,
   jumpQueued: false,
@@ -76,11 +77,11 @@ const cfg = {
 ```js
 const characterController = world.createCharacterController(0.02);
 characterController.setUp({ x: 0, y: 1, z: 0 });
-characterController.setNormalNudgeFactor(0.02);
+characterController.setNormalNudgeFactor(0.0001);
 characterController.setSlideEnabled(true);
 characterController.enableAutostep(cfg.stepHeight, cfg.stepMinWidth, true);
 characterController.enableSnapToGround(cfg.snapDistance);
-characterController.setApplyImpulsesToDynamicBodies(false); // we inject push manually
+characterController.setApplyImpulsesToDynamicBodies(false); // configured per character from mass
 ```
 
 ## 5) Per-frame update pipeline
@@ -93,11 +94,13 @@ function updateCharacterKCC(go, dt) {
   const collider = getMainCollider(go);
   if (!collider) return;
 
-  // 1) start from input velocity
+  // 1) derive planar velocity from input and support friction
+  // Supported ground blends toward the target. Low friction keeps momentum.
+  updatePlanarVelocityFromSupportFriction(go, st, dt);
   const desiredMove = vec3(
-    st.desiredVelocity.x * dt,
+    st.planarVelocity.x * dt,
     0,
-    st.desiredVelocity.z * dt
+    st.planarVelocity.z * dt
   );
 
   // 2) add platform carry from previous support frame
@@ -116,9 +119,12 @@ function updateCharacterKCC(go, dt) {
 
   // 6) configure autostep/slope each frame (allows per-object tuning)
   configureKCCFromObject(go);
+  // Positive mass lets the character push dynamic bodies; zero disables it.
+  characterController.setApplyImpulsesToDynamicBodies(go.mass > 0);
+  characterController.setCharacterMass(go.mass > 0 ? go.mass : null);
 
   // 7) solve pass 1
-  characterController.computeColliderMovement(collider, desiredMove);
+  characterController.computeColliderMovement(collider, desiredMove, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS);
   let corrected = characterController.computedMovement();
 
   // 8) optional pass 2: compensation against locked moving/rotating obstacles
@@ -388,7 +394,7 @@ function applyCompensationPassIfNeeded(go, collider, desiredMove, corrected) {
 
   clampLengthXZInPlace(compensation, 1.25);
   const secondDesired = desiredMove.clone().add(compensation);
-  characterController.computeColliderMovement(collider, secondDesired);
+  characterController.computeColliderMovement(collider, secondDesired, RAPIER.QueryFilterFlags.EXCLUDE_SENSORS);
   return characterController.computedMovement();
 }
 ```
@@ -459,15 +465,12 @@ Do not write directly to body translation for normal movement; let KCC own locom
 
 ## 16) Minimal order of operations (checklist)
 
-1. Update support carry baseline.
-2. Collect collision-based external/forced pushes.
-3. Build desired move from input + carry + pushes + vertical.
-4. Solve KCC pass 1.
-5. Solve optional compensation pass 2.
-6. Apply translation.
-7. Apply upright rotation (+ optional support yaw).
-8. Update grounded/jump state.
-9. Clear one-frame intents.
+1. Snapshot body motion and update support carry baseline.
+2. Build desired move from friction-adjusted input + carry + pushes + vertical.
+3. Solve KCC pass 1 and optional compensation pass 2.
+4. Apply translation and upright rotation (+ optional support yaw).
+5. Update grounded/jump state and clear one-frame intents.
+6. Step Rapier, then collect collision pushes and resolve support for the next frame.
 
 If you keep this order, the controller remains predictable even in complex moving-platform scenes.
 

@@ -21,6 +21,7 @@
 import * as THREE from "three";
 
 const EPS = 0.000001;
+const NORMAL_NUDGE_FACTOR = 0.0001;
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -113,7 +114,7 @@ export class RapierKccPlugAndPlay {
     this.characterController = this.physicsWorld.createCharacterController(0.02);
     if (!this.characterController) return;
     if (typeof this.characterController.setUp === "function") this.characterController.setUp({ x: 0, y: 1, z: 0 });
-    if (typeof this.characterController.setNormalNudgeFactor === "function") this.characterController.setNormalNudgeFactor(0.02);
+    if (typeof this.characterController.setNormalNudgeFactor === "function") this.characterController.setNormalNudgeFactor(NORMAL_NUDGE_FACTOR);
     if (typeof this.characterController.setSlideEnabled === "function") this.characterController.setSlideEnabled(true);
     if (typeof this.characterController.enableAutostep === "function") {
       this.characterController.enableAutostep(this.cfg.defaultStepHeight, this.cfg.defaultStepWidth, true);
@@ -134,6 +135,8 @@ export class RapierKccPlugAndPlay {
     go._kccJumpCount = 0;
     go._kccGroundGraceTime = 0;
     go._kccDesiredVelocity = ensureVector3(go._kccDesiredVelocity).set(0, 0, 0);
+    go._kccPlanarVelocity = ensureVector3(go._kccPlanarVelocity).set(0, 0, 0);
+    go._kccSurfaceFriction = 1.0;
     go._kccExternalDisplacement = ensureVector3(go._kccExternalDisplacement).set(0, 0, 0);
     go._kccForcedDisplacement = ensureVector3(go._kccForcedDisplacement).set(0, 0, 0);
     go._kccLastCorrectedMove = ensureVector3(go._kccLastCorrectedMove).set(0, 0, 0);
@@ -538,7 +541,31 @@ export class RapierKccPlugAndPlay {
       if (!collider) continue;
 
       const desiredVelocity = go._kccDesiredVelocity || new THREE.Vector3();
-      const desiredMove = new THREE.Vector3((Number(desiredVelocity.x) || 0) * deltaTime, 0, (Number(desiredVelocity.z) || 0) * deltaTime);
+      const targetX = Number(desiredVelocity.x) || 0;
+      const targetZ = Number(desiredVelocity.z) || 0;
+      const planarVelocity = go._kccPlanarVelocity = ensureVector3(go._kccPlanarVelocity);
+      const hasMoveInput = Math.abs(targetX) > 0.0001 || Math.abs(targetZ) > 0.0001;
+      const hasGroundSupport = !!(go._hadKccGrounded && go._hadPlatformContact && go._standingOn);
+      let supportFriction = Number(hasGroundSupport ? go._standingOn.friction : go.friction);
+      if (!Number.isFinite(supportFriction)) supportFriction = 1.0;
+      const frictionScale = Number(go.characterSurfaceFrictionScale);
+      supportFriction *= Number.isFinite(frictionScale) ? Math.max(0, frictionScale) : 1.0;
+      supportFriction = clamp(supportFriction, 0, 1);
+      go._kccSurfaceFriction = supportFriction;
+      if (hasGroundSupport) {
+        const responseRate = hasMoveInput ? 2.0 + 28.0 * supportFriction : 0.05 + 22.0 * supportFriction;
+        const blend = 1.0 - Math.exp(-responseRate * deltaTime);
+        planarVelocity.x += (targetX - planarVelocity.x) * blend;
+        planarVelocity.z += (targetZ - planarVelocity.z) * blend;
+        if (!hasMoveInput && supportFriction < 0.02) {
+          const tinyDrag = Math.max(0, 1 - deltaTime * 0.015);
+          planarVelocity.x *= tinyDrag;
+          planarVelocity.z *= tinyDrag;
+        }
+      } else {
+        planarVelocity.set(targetX, 0, targetZ);
+      }
+      const desiredMove = new THREE.Vector3(planarVelocity.x * deltaTime, 0, planarVelocity.z * deltaTime);
       if (!Number.isFinite(go._kccGroundGraceTime)) go._kccGroundGraceTime = 0;
       if (go._hadPlatformContact && go._hadKccGrounded && go._kccPlatformDelta) desiredMove.add(go._kccPlatformDelta);
       if (go._kccExternalDisplacement) desiredMove.add(go._kccExternalDisplacement);
@@ -599,8 +626,86 @@ export class RapierKccPlugAndPlay {
         }
       }
 
-      this.characterController.computeColliderMovement(collider, desiredMove);
+      const sensorFlag = typeof RAPIER !== "undefined" && RAPIER.QueryFilterFlags
+        ? Number(RAPIER.QueryFilterFlags.EXCLUDE_SENSORS) : NaN;
+      const computeMovement = (move) => {
+        if (Number.isFinite(sensorFlag)) this.characterController.computeColliderMovement(collider, move, sensorFlag);
+        else this.characterController.computeColliderMovement(collider, move);
+      };
+      const massRaw = Number(go.mass);
+      const mass = Number.isFinite(massRaw) && massRaw > EPS ? Math.max(EPS, massRaw) : null;
+      if (typeof this.characterController.setApplyImpulsesToDynamicBodies === "function") {
+        this.characterController.setApplyImpulsesToDynamicBodies(!!mass);
+      }
+      if (typeof this.characterController.setCharacterMass === "function") {
+        this.characterController.setCharacterMass(mass);
+      }
+      computeMovement(desiredMove);
       let corrected = this.characterController.computedMovement();
+
+      // A locked moving obstacle can cancel the character's outward motion on the
+      // first solve. Measure the missing contact-point displacement and solve again.
+      let compensationX = 0;
+      let compensationZ = 0;
+      const collisionCount = typeof this.characterController.numComputedCollisions === "function"
+        ? Number(this.characterController.numComputedCollisions()) || 0 : 0;
+      for (let i = 0; i < collisionCount; i++) {
+        const collision = this.characterController.computedCollision(i);
+        if (!collision?.collider || typeof collision.collider.parent !== "function") continue;
+        const obstacle = this.getGameObjectFromBody(collision.collider.parent());
+        if (!this.isFullyLockedDynamic(obstacle)) continue;
+        const normal = collision.normal1 && typeof collision.normal1 === "object"
+          ? collision.normal1 : collision.worldNormal1?.();
+        const witness1 = collision.witness1 && typeof collision.witness1 === "object"
+          ? collision.witness1 : collision.worldWitness1?.();
+        const witness2 = collision.witness2 && typeof collision.witness2 === "object"
+          ? collision.witness2 : collision.worldWitness2?.();
+        const toi = Number(typeof collision.toi === "function" ? collision.toi() : collision.toi);
+        if (Number.isFinite(toi) && toi > 0.20) continue;
+        if (witness1 && witness2 && Math.hypot(
+          (Number(witness1.x) || 0) - (Number(witness2.x) || 0),
+          (Number(witness1.y) || 0) - (Number(witness2.y) || 0),
+          (Number(witness1.z) || 0) - (Number(witness2.z) || 0)
+        ) > 0.06) continue;
+        if ((Number(normal?.y) || 0) > 0.50) continue;
+        const normalLength = vecLength2D(normal?.x, normal?.z);
+        if (normalLength <= 1e-5) continue;
+        const nx = (Number(normal.x) || 0) / normalLength;
+        const nz = (Number(normal.z) || 0) / normalLength;
+        let platformDx = 0;
+        let platformDz = 0;
+        if (witness1 && obstacle._contactMotionPrevPos && obstacle._contactMotionCurrPos && obstacle._contactMotionDeltaQuat) {
+          const relPrev = new THREE.Vector3(
+            (Number(witness1.x) || 0) - obstacle._contactMotionPrevPos.x,
+            (Number(witness1.y) || 0) - obstacle._contactMotionPrevPos.y,
+            (Number(witness1.z) || 0) - obstacle._contactMotionPrevPos.z
+          );
+          const relRotated = relPrev.applyQuaternion(obstacle._contactMotionDeltaQuat);
+          platformDx = obstacle._contactMotionCurrPos.x + relRotated.x - (Number(witness1.x) || 0);
+          platformDz = obstacle._contactMotionCurrPos.z + relRotated.z - (Number(witness1.z) || 0);
+        } else if (typeof obstacle.body?.linvel === "function") {
+          const velocity = obstacle.body.linvel();
+          platformDx = (Number(velocity.x) || 0) * deltaTime;
+          platformDz = (Number(velocity.z) || 0) * deltaTime;
+        }
+        const outward = platformDx * nx + platformDz * nz;
+        if (outward <= 1e-6) continue;
+        const correctedOutward = (Number(corrected.x) || 0) * nx + (Number(corrected.z) || 0) * nz;
+        if (correctedOutward + 1e-6 < outward) {
+          const missing = Math.min(1.20, outward - correctedOutward);
+          compensationX += nx * missing;
+          compensationZ += nz * missing;
+        }
+      }
+      const compensationLength = vecLength2D(compensationX, compensationZ);
+      if (compensationLength > 1e-5) {
+        const scale = compensationLength > 1.25 ? 1.25 / compensationLength : 1;
+        const secondMove = desiredMove.clone();
+        secondMove.x += compensationX * scale;
+        secondMove.z += compensationZ * scale;
+        computeMovement(secondMove);
+        corrected = this.characterController.computedMovement();
+      }
 
       let groundedNow = !!this.characterController.computedGrounded();
       if (groundedNow) {
@@ -632,6 +737,7 @@ export class RapierKccPlugAndPlay {
       }
 
       go._kccGrounded = groundedNow;
+      go._rotationLockYRequested = false;
       go._kccLastCorrectedMove = ensureVector3(go._kccLastCorrectedMove).set(correctedX, correctedY, correctedZ);
       if (groundedNow) {
         if (go._kccVerticalVelocity < 0) go._kccVerticalVelocity = 0;
@@ -648,9 +754,10 @@ export class RapierKccPlugAndPlay {
     Call order every frame:
     1) beforePhysicsStep(dt)
     2) updatePlatformCarryState()
-    3) collectCollisionPushes()
-    4) updateResolvedSupport()
-    5) solveCharacters(dt)
+    3) solveCharacters(dt)
+    4) step the Rapier world
+    5) collectCollisionPushes()
+    6) updateResolvedSupport()
   */
 }
 

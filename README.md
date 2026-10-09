@@ -22,6 +22,9 @@ It is extracted from a real engine and designed to be **close to plug-and-play**
 * Compensation pass for locked/moving obstacles
 * Upright character behavior (no unwanted tilt)
 * Grounded hysteresis and anti-jitter fixes
+* Surface friction that changes acceleration and stopping on supported ground
+* Character mass controls whether the KCC pushes dynamic bodies
+* Sensor exclusion during movement queries
 
 ---
 
@@ -45,13 +48,16 @@ This is a **working reference implementation**, not just theory.
 ### Basic integration
 
 1. Plug the controller into your update loop
-2. Connect your input to `desiredVelocity`
-3. Call the update function each frame
+2. Write each character's `_kccDesiredVelocity` every frame
+3. Call `beforePhysicsStep(dt)`, `updatePlatformCarryState()` and `solveCharacters(dt)` before stepping Rapier
+4. After the physics step, call `collectCollisionPushes()` and `updateResolvedSupport()`
 
 ### Notes
 
 * Some adaptation may be required depending on your engine structure
 * You control movement through high-level input, not direct transforms
+* Set `go.mass` to a positive value to push dynamic bodies, or `0` to disable that behavior
+* Set `go.characterSurfaceFrictionScale` to tune how strongly support friction affects movement
 
 **Tested with:**
 
